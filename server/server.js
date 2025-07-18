@@ -1,132 +1,141 @@
-// server.js - Main server file for Socket.io chat application
-
+// server/server.js
 const express = require('express');
-const http = require('http');
+const { createServer } = require('http');
 const { Server } = require('socket.io');
-const cors = require('cors');
+const cors =require('cors');
 const dotenv = require('dotenv');
-const path = require('path');
+const Message = require('./models/Message.js');
 
-// Load environment variables
 dotenv.config();
 
-// Initialize Express app
+// Initialize Express and HTTP server
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
-    methods: ['GET', 'POST'],
-    credentials: true,
-  },
-});
-
-// Middleware
 app.use(cors());
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+const httpServer = createServer(app);
 
-// Store connected users and messages
-const users = {};
-const messages = [];
-const typingUsers = {};
+// Socket.io setup
+const io = new Server(httpServer, {
+  cors: {
+    origin: process.env.CLIENT_URL || 'http://localhost:3000',
+    methods: ['GET', 'POST']
+  },
+  connectionStateRecovery: {
+    maxDisconnectionDuration: 2 * 60 * 1000, // 2 minutes
+    skipMiddlewares: true
+  }
+});
 
-// Socket.io connection handler
+// Authentication middleware
+io.use((socket, next) => {
+  const username = socket.handshake.auth.username;
+  if (!username) {
+    return next(new Error('Authentication error: Username required'));
+  }
+  socket.data.username = username;
+  next();
+});
+
+// Connection handler
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
+  console.log(`User connected: ${socket.data.username} (ID: ${socket.id})`);
 
-  // Handle user joining
-  socket.on('user_join', (username) => {
-    users[socket.id] = { username, id: socket.id };
-    io.emit('user_list', Object.values(users));
-    io.emit('user_joined', { username, id: socket.id });
-    console.log(`${username} joined the chat`);
+  // Notify all users about new connection
+  io.emit('user-notification', {
+    text: `${socket.data.username} joined the chat`,
+    type: 'join',
+    timestamp: new Date()
   });
 
-  // Handle chat messages
-  socket.on('send_message', (messageData) => {
-    const message = {
-      ...messageData,
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
-      timestamp: new Date().toISOString(),
-    };
-    
-    messages.push(message);
-    
-    // Limit stored messages to prevent memory issues
-    if (messages.length > 100) {
-      messages.shift();
-    }
-    
-    io.emit('receive_message', message);
-  });
+  // Global chat
+  socket.on('send-message', async (message) => {
+    try {
+      // Save to database (optional)
+      const savedMessage = await Message.create({
+        sender: socket.data.username,
+        text: message,
+        room: 'global'
+      });
 
-  // Handle typing indicator
-  socket.on('typing', (isTyping) => {
-    if (users[socket.id]) {
-      const username = users[socket.id].username;
-      
-      if (isTyping) {
-        typingUsers[socket.id] = username;
-      } else {
-        delete typingUsers[socket.id];
-      }
-      
-      io.emit('typing_users', Object.values(typingUsers));
+      io.emit('receive-message', savedMessage);
+
+      // Notification
+      io.emit('message-notification', {
+        sender: socket.data.username,
+        preview: message.slice(0, 20)
+      });
+    } catch (err) {
+      console.error('Message save error:', err);
     }
   });
 
-  // Handle private messages
-  socket.on('private_message', ({ to, message }) => {
-    const messageData = {
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
-      message,
-      timestamp: new Date().toISOString(),
-      isPrivate: true,
-    };
-    
-    socket.to(to).emit('private_message', messageData);
-    socket.emit('private_message', messageData);
+  // Private messaging
+  socket.on('private-message', ({ recipient, text }) => {
+    io.to(recipient).emit('private-message', {
+      sender: socket.data.username,
+      recipient,
+      text,
+      timestamp: new Date()
+    });
   });
 
-  // Handle disconnection
+  // Room handling
+  socket.on('join-room', (room) => {
+    socket.join(room);
+    socket.emit('room-joined', room);
+  });
+
+  socket.on('room-message', ({ room, text }) => {
+    io.to(room).emit('room-message', {
+      sender: socket.data.username,
+      room,
+      text,
+      timestamp: new Date()
+    });
+  });
+
+  // File sharing
+  socket.on('send-file', (file) => {
+    io.emit('receive-file', {
+      sender: socket.data.username,
+      file,
+      timestamp: new Date()
+    });
+  });
+
+  // Message pagination
+  socket.on('load-messages', async ({ room, page = 1 }) => {
+    const messages = await Message.find({ room })
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * 10)
+      .limit(10);
+    socket.emit('messages-loaded', { room, messages });
+  });
+
+  // Typing indicator
+  socket.on('typing', (room) => {
+    socket.to(room).emit('user-typing', {
+      username: socket.data.username,
+      room
+    });
+  });
+
+  // Disconnection
   socket.on('disconnect', () => {
-    if (users[socket.id]) {
-      const { username } = users[socket.id];
-      io.emit('user_left', { username, id: socket.id });
-      console.log(`${username} left the chat`);
-    }
-    
-    delete users[socket.id];
-    delete typingUsers[socket.id];
-    
-    io.emit('user_list', Object.values(users));
-    io.emit('typing_users', Object.values(typingUsers));
+    io.emit('user-notification', {
+      text: `${socket.data.username} left the chat`,
+      type: 'leave',
+      timestamp: new Date()
+    });
   });
 });
 
-// API routes
-app.get('/api/messages', (req, res) => {
-  res.json(messages);
-});
-
-app.get('/api/users', (req, res) => {
-  res.json(Object.values(users));
-});
-
-// Root route
-app.get('/', (req, res) => {
-  res.send('Socket.io Chat Server is running');
+// Error handling
+io.on('connection_error', (err) => {
+  console.error('Socket connection error:', err.message);
 });
 
 // Start server
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
+httpServer.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-
-module.exports = { app, server, io }; 
